@@ -1,0 +1,395 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Criar projeto e compilar
+        run: |
+          mkdir -p poco/app/src/main/java/com/poco/optimizer
+          cd poco
+          cat > settings.gradle.kts <<'FIM0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PocoOptimizer"
+          include(":app")
+          FIM0
+          cat > build.gradle.kts <<'FIM1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIM1
+          cat > gradle.properties <<'FIM2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          FIM2
+          cat > app/build.gradle.kts <<'FIM3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.poco.optimizer"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.poco.optimizer"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          FIM3
+          cat > app/src/main/AndroidManifest.xml <<'FIM4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="Poco F7 Optimizer"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FIM4
+          cat > app/src/main/java/com/poco/optimizer/Shell.kt <<'FIM5'
+          package com.poco.optimizer
+
+          import rikka.shizuku.Shizuku
+
+          /** Executa comandos de shell com a permissão do Shizuku (UID shell/ADB). */
+          object Shell {
+              private val newProcess by lazy {
+                  Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java,
+                      Array<String>::class.java,
+                      String::class.java
+                  ).apply { isAccessible = true }
+              }
+
+              fun run(cmd: String): String {
+                  val p = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText()
+                  val err = p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return (out + err).trim()
+              }
+          }
+          FIM5
+          cat > app/src/main/java/com/poco/optimizer/Optimizer.kt <<'FIM6'
+          package com.poco.optimizer
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class Optimizer(ctx: Context, private val log: (String) -> Unit) {
+
+              private val prefs = ctx.getSharedPreferences("backup", Context.MODE_PRIVATE)
+
+              private val bloat = listOf(
+                  "com.miui.analytics",
+                  "com.miui.msa.global",
+                  "com.miui.systemAdSolution",
+                  "com.miui.bugreport",
+                  "com.xiaomi.midrop",
+                  "com.miui.cloudservice.sysbase"
+              )
+
+              private fun sh(c: String) = Shell.run(c)
+
+              /** Altera uma setting guardando o valor original para restaurar depois. */
+              private fun put(ns: String, key: String, value: String) {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  val k = "$ns:$key"
+                  if (!saved.has(k)) {
+                      saved.put(k, sh("settings get $ns $key"))
+                      prefs.edit().putString("settings", saved.toString()).apply()
+                  }
+                  sh("settings put $ns $key $value")
+              }
+
+              fun info() {
+                  log("Modelo: ${sh("getprop ro.product.model")} | Android ${sh("getprop ro.build.version.release")}")
+                  log(sh("dumpsys battery | grep -E 'level|temperature|health'"))
+                  log(sh("df -h /data | tail -1"))
+                  log(sh("grep -E 'MemTotal|MemAvailable' /proc/meminfo"))
+                  log(sh("dumpsys thermalservice | grep -E 'Temperature\\{' | head -8"))
+              }
+
+              fun compile() {
+                  log("Compilando apps (pode levar vários minutos)...")
+                  log(sh("cmd package compile -m speed-profile -a"))
+                  log(sh("cmd package bg-dexopt-job"))
+                  log("Compilação concluída.")
+              }
+
+              fun cleanCache() {
+                  sh("pm trim-caches 999G")
+                  log("Cache limpo.")
+              }
+
+              fun animations(scale: String = "0.5") {
+                  listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+                      .forEach { put("global", it, scale) }
+                  log("Animações em ${scale}x.")
+              }
+
+              fun refresh120() {
+                  put("system", "min_refresh_rate", "120")
+                  put("system", "peak_refresh_rate", "120")
+                  log("Tela fixa em 120 Hz (gasta mais bateria).")
+              }
+
+              fun refreshAdaptive() {
+                  put("system", "min_refresh_rate", "60")
+                  put("system", "peak_refresh_rate", "120")
+                  log("Tela adaptativa 60-120 Hz.")
+              }
+
+              private fun thirdParty() =
+                  sh("pm list packages -3").lines().map { it.removePrefix("package:").trim() }.filter { it.isNotEmpty() }
+
+              fun killBackground() {
+                  val me = "com.poco.optimizer"
+                  val list = thirdParty().filter { it != me }
+                  list.forEach { sh("am force-stop $it") }
+                  log("${list.size} apps encerrados.")
+              }
+
+              fun standbyRestricted() {
+                  val keep = listOf("whatsapp", "telegram", "google", "gms", "bank", "banco", "nubank", "launcher", "keyboard", "optimizer")
+                  val list = thirdParty().filter { p -> keep.none { p.contains(it, true) } }
+                  list.forEach { sh("am set-standby-bucket $it restricted") }
+                  log("${list.size} apps em standby restrito (notificações podem atrasar).")
+              }
+
+              fun removeBloat() {
+                  val removed = JSONArray(prefs.getString("removed", "[]")!!)
+                  bloat.forEach { p ->
+                      val ok = sh("pm uninstall -k --user 0 $p").contains("Success")
+                      log((if (ok) "✔ " else "· ") + p)
+                      if (ok) removed.put(p)
+                  }
+                  prefs.edit().putString("removed", removed.toString()).apply()
+              }
+
+              fun batteryReset() {
+                  sh("dumpsys batterystats --reset")
+                  log("Estatísticas de bateria zeradas.")
+              }
+
+              fun systemTweaks() {
+                  put("global", "app_standby_enabled", "1")
+                  put("global", "adaptive_battery_management_enabled", "1")
+                  put("global", "cached_apps_freezer", "enabled")
+                  log("Congelador de apps em cache e bateria adaptativa ativados.")
+              }
+
+              fun privateDns(host: String?) {
+                  if (host == null) {
+                      put("global", "private_dns_mode", "opportunistic")
+                  } else {
+                      put("global", "private_dns_mode", "hostname")
+                      put("global", "private_dns_specifier", host)
+                  }
+                  log("DNS privado: ${host ?: "automático"}")
+              }
+
+              fun boost() {
+                  cleanCache(); animations(); systemTweaks(); killBackground(); batteryReset(); compile()
+                  log("⚡ Boost completo finalizado.")
+              }
+
+              fun restore() {
+                  val saved = JSONObject(prefs.getString("settings", "{}")!!)
+                  saved.keys().forEach { k ->
+                      val (ns, key) = k.split(":")
+                      val v = saved.getString(k)
+                      if (v == "null" || v.isEmpty()) sh("settings delete $ns $key")
+                      else sh("settings put $ns $key $v")
+                  }
+                  val removed = JSONArray(prefs.getString("removed", "[]")!!)
+                  for (i in 0 until removed.length()) log(sh("cmd package install-existing ${removed.getString(i)}"))
+                  prefs.edit().clear().apply()
+                  log("Tudo restaurado.")
+              }
+          }
+          FIM6
+          cat > app/src/main/java/com/poco/optimizer/MainActivity.kt <<'FIM7'
+          package com.poco.optimizer
+
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.View
+          import android.view.WindowInsets
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+
+              private val exec = Executors.newSingleThreadExecutor()
+              private lateinit var status: TextView
+              private lateinit var logView: TextView
+              private val buttons = mutableListOf<Button>()
+              private lateinit var opt: Optimizer
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+              private val binderListener = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+              private val deadListener = Shizuku.OnBinderDeadListener { runOnUiThread { refresh() } }
+
+              private fun ready() =
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  opt = Optimizer(this) { msg -> runOnUiThread { logView.append(msg + "\n") } }
+
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val pad = dp(16)
+                  root.setOnApplyWindowInsetsListener { v, ins ->
+                      val b = ins.getInsets(WindowInsets.Type.systemBars())
+                      v.setPadding(pad, b.top + pad, pad, b.bottom + pad)
+                      ins
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "POCO F7 OPTIMIZER"; textSize = 22f; setTypeface(null, Typeface.BOLD)
+                  })
+                  status = TextView(this).apply { setPadding(0, dp(8), 0, dp(8)) }
+                  root.addView(status)
+
+                  val grant = Button(this).apply {
+                      text = "Conceder permissão Shizuku"
+                      setOnClickListener {
+                          if (!Shizuku.pingBinder()) toast("Abra o app Shizuku e inicie o serviço primeiro.")
+                          else Shizuku.requestPermission(100)
+                      }
+                  }
+                  root.addView(grant)
+
+                  fun add(label: String, action: () -> Unit) {
+                      val b = Button(this).apply {
+                          text = label
+                          setOnClickListener { runTask(action) }
+                      }
+                      buttons.add(b); root.addView(b)
+                  }
+
+                  add("ℹ️ Informações do aparelho") { opt.info() }
+                  add("⚡ BOOST COMPLETO") { opt.boost() }
+                  add("Compilar apps (speed-profile)") { opt.compile() }
+                  add("Limpar cache de todos os apps") { opt.cleanCache() }
+                  add("Animações 0.5x") { opt.animations("0.5") }
+                  add("Tela 120 Hz fixa") { opt.refresh120() }
+                  add("Tela adaptativa 60-120 Hz") { opt.refreshAdaptive() }
+                  add("Encerrar apps em segundo plano") { opt.killBackground() }
+                  add("Standby restrito p/ apps pouco usados") { opt.standbyRestricted() }
+                  add("Remover anúncios/analytics Xiaomi") { opt.removeBloat() }
+                  add("Zerar estatísticas de bateria") { opt.batteryReset() }
+                  add("Congelar apps em cache + bateria adaptativa") { opt.systemTweaks() }
+                  add("DNS privado: Cloudflare") { opt.privateDns("one.one.one.one") }
+                  add("DNS privado: Google") { opt.privateDns("dns.google") }
+                  add("DNS privado: automático") { opt.privateDns(null) }
+                  add("♻️ RESTAURAR tudo") { opt.restore() }
+
+                  logView = TextView(this).apply {
+                      setTextIsSelectable(true); typeface = Typeface.MONOSPACE; textSize = 12f
+                      setPadding(0, dp(12), 0, 0)
+                  }
+                  root.addView(logView)
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  Shizuku.addRequestPermissionResultListener(permListener)
+                  Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  Shizuku.addBinderDeadListener(deadListener)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ok = ready()
+                  status.text = when {
+                      !Shizuku.pingBinder() -> "● Shizuku não está rodando"
+                      !ok -> "● Shizuku ativo, falta permissão"
+                      else -> "● Pronto"
+                  }
+                  buttons.forEach { it.isEnabled = ok }
+              }
+
+              private fun runTask(action: () -> Unit) {
+                  buttons.forEach { it.isEnabled = false }
+                  exec.execute {
+                      try { action() } catch (e: Throwable) { opt2("Erro: ${e.message}") }
+                      runOnUiThread { refresh() }
+                  }
+              }
+
+              private fun opt2(m: String) = runOnUiThread { logView.append(m + "\n") }
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+
+              override fun onDestroy() {
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  Shizuku.removeBinderReceivedListener(binderListener)
+                  Shizuku.removeBinderDeadListener(deadListener)
+                  super.onDestroy()
+              }
+          }
+          FIM7
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocoOptimizer-apk
+          path: poco/app/build/outputs/apk/debug/app-debug.apk
